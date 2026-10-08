@@ -1,0 +1,289 @@
+name: krinry Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: Build type
+        required: true
+        default: release
+        type: choice
+        options:
+          - debug
+          - profile
+          - release
+      output_type:
+        description: Output type
+        required: true
+        default: apk
+        type: choice
+        options:
+          - apk
+          - appbundle
+          - apk-split
+      target_platform:
+        description: Target platform
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - android-arm64
+          - android-arm
+          - android-x64
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.0'
+          channel: stable
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Test
+        run: flutter test
+
+      - name: Create Android project
+        run: |
+          rm -rf android
+
+          flutter create \
+            --org com.alaa \
+            --platforms android \
+            .
+
+          test -f android/settings.gradle.kts
+          test -f android/app/build.gradle.kts
+
+          echo "✓ Android project generated"
+
+      - name: Convert Android project to Groovy
+        run: |
+          rm -f android/settings.gradle.kts
+          rm -f android/build.gradle.kts
+          rm -f android/app/build.gradle.kts
+
+          cat > android/settings.gradle <<'GROOVY'
+          pluginManagement {
+              def flutterSdkPath = {
+                  def properties = new Properties()
+                  file("local.properties").withInputStream {
+                      properties.load(it)
+                  }
+
+                  def flutterSdkPath = properties.getProperty("flutter.sdk")
+
+                  assert flutterSdkPath != null, "flutter.sdk not set in local.properties"
+
+                  return flutterSdkPath
+              }()
+
+              includeBuild("$flutterSdkPath/packages/flutter_tools/gradle")
+
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          plugins {
+              id "dev.flutter.flutter-plugin-loader" version "1.0.0"
+              id "com.android.application" version "8.9.1" apply false
+              id "org.jetbrains.kotlin.android" version "2.1.0" apply false
+          }
+
+          include ":app"
+          GROOVY
+
+          cat > android/build.gradle <<'GROOVY'
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven {
+                      url = uri("https://storage.googleapis.com/download.flutter.io")
+                  }
+              }
+          }
+
+          rootProject.buildDir = "../build"
+
+          subprojects {
+              project.buildDir = "${rootProject.buildDir}/${project.name}"
+          }
+
+          subprojects {
+              project.evaluationDependsOn(":app")
+          }
+
+          tasks.register("clean", Delete) {
+              delete rootProject.buildDir
+          }
+          GROOVY
+
+          cat > android/app/build.gradle <<'GROOVY'
+          plugins {
+              id "com.android.application"
+              id "org.jetbrains.kotlin.android"
+              id "dev.flutter.flutter-gradle-plugin"
+          }
+
+          android {
+              namespace "com.alaa.dex_host"
+              compileSdk 36
+              ndkVersion "28.2.13676358"
+
+              defaultConfig {
+                  applicationId "com.alaa.dex_host"
+                  minSdk 24
+                  targetSdk 36
+                  versionCode 1
+                  versionName "1.0.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.debug
+                  }
+              }
+          }
+
+          flutter {
+              source "../.."
+          }
+          GROOVY
+
+          cat > android/gradle.properties <<'PROPS'
+          org.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=1G -XX:+HeapDumpOnOutOfMemoryError
+          android.useAndroidX=true
+          android.enableJetifier=true
+          PROPS
+
+          sed -i \
+            's#distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.11.1-all.zip#' \
+            android/gradle/wrapper/gradle-wrapper.properties
+
+          echo "✓ Converted to Groovy"
+
+      - name: Configure Android toolchain
+        run: |
+          SDKMANAGER="$(command -v sdkmanager || true)"
+
+          if [ -z "$SDKMANAGER" ]; then
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          fi
+
+          yes | "$SDKMANAGER" --install "ndk;28.2.13676358"
+
+      - name: Configure Android manifest
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("android/app/src/main/AndroidManifest.xml")
+          s = p.read_text()
+
+          permissions = [
+              '    <uses-permission android:name="android.permission.INTERNET" />',
+              '    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />',
+          ]
+
+          for permission in permissions:
+              if permission not in s:
+                  s = s.replace(
+                      "<application ",
+                      permission + "\n    <application ",
+                      1
+                  )
+
+          if "android:usesCleartextTraffic" not in s:
+              s = s.replace(
+                  "<application ",
+                  '<application android:usesCleartextTraffic="true" ',
+                  1
+              )
+
+          p.write_text(s)
+          PY
+
+      - name: Verify Android project
+        run: |
+          test -f android/settings.gradle
+          test -f android/build.gradle
+          test -f android/app/build.gradle
+
+          ! test -f android/settings.gradle.kts
+          ! test -f android/build.gradle.kts
+          ! test -f android/app/build.gradle.kts
+
+          grep -q "dev.flutter.flutter-plugin-loader" android/settings.gradle
+          grep -q "com.android.application.*8.9.1" android/settings.gradle
+          grep -q "org.jetbrains.kotlin.android.*2.1.0" android/settings.gradle
+          grep -q "dev.flutter.flutter-gradle-plugin" android/app/build.gradle
+          grep -q "compileSdk 36" android/app/build.gradle
+          grep -q "minSdk 24" android/app/build.gradle
+          grep -q "targetSdk 36" android/app/build.gradle
+          grep -q "28.2.13676358" android/app/build.gradle
+
+          echo "✓ Android Groovy configuration verified"
+
+      - name: Build
+        env:
+          BUILD_TYPE: ${{ github.event.inputs.build_type }}
+          OUTPUT_TYPE: ${{ github.event.inputs.output_type }}
+          TARGET_PLATFORM: ${{ github.event.inputs.target_platform }}
+        run: |
+          if [ "$OUTPUT_TYPE" = "apk" ]; then
+            if [ "$TARGET_PLATFORM" != "all" ]; then
+              flutter build apk \
+                --$BUILD_TYPE \
+                --target-platform "$TARGET_PLATFORM"
+            else
+              flutter build apk --$BUILD_TYPE
+            fi
+
+          elif [ "$OUTPUT_TYPE" = "apk-split" ]; then
+            flutter build apk \
+              --$BUILD_TYPE \
+              --split-per-abi
+
+          else
+            flutter build appbundle --$BUILD_TYPE
+          fi
+
+      - name: Upload APK / AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: dex-host-build
+          path: |
+            build/app/outputs/flutter-apk/*.apk
+            build/app/outputs/bundle/*/*.aab
+          retention-days: 7
